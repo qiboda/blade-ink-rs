@@ -11,13 +11,15 @@ use crate::{
     compat::io::{Read, Write},
     compat::{cell::RefCell, rc::Rc},
     ink_list::InkList,
-    runtime::Runtime,
+    runtime::{ContinueStatus, Runtime},
     story::error::StoryError,
     story::variable_observer::{VariableObserver, VariableObserverHandle, VariableObserverResult},
     story::{
         INK_VERSION_CURRENT, TimeSource,
         error::{ErrorHandler, ErrorType},
-        external_functions::{ExternalFunction, ExternalFunctionResult},
+        external_functions::{
+            ExternalFunction, ExternalFunctionResult, PendingExternal, PendingExternalFunction,
+        },
     },
     story_content::{LoadObserver, LoadPhase, NoopLoadObserver, StoryData},
     value_type::ValueType,
@@ -201,8 +203,17 @@ impl Story {
     }
 
     /// Continues the current flow until the next line or choice boundary.
+    ///
+    /// Returns [`StoryError::ExternalFunctionPending`] if the story stopped at a
+    /// pending external function. Inspect [`Self::pending_external`], call
+    /// [`Self::resume_external`], then continue again.
     pub fn cont(&mut self) -> Result<String, StoryError> {
         self.continue_async(0.0)?;
+        if let Some(pending) = self.runtime.pending_external() {
+            return Err(StoryError::ExternalFunctionPending {
+                function_name: pending.name().to_owned(),
+            });
+        }
         self.get_current_text()
     }
 
@@ -252,7 +263,7 @@ impl Story {
         });
         self.last_time = last_time;
         match result {
-            Ok(Some(_)) => {
+            Ok(ContinueStatus::Finished(_)) => {
                 self.notify_changed_variables()?;
                 if let Some(handler) = &self.on_error {
                     for warning in &self.warnings {
@@ -262,7 +273,7 @@ impl Story {
                 self.warnings.clear();
                 Ok(())
             }
-            Ok(None) => Ok(()),
+            Ok(ContinueStatus::Yielded | ContinueStatus::PendingExternal) => Ok(()),
             Err(error) => {
                 if matches!(
                     error,
@@ -636,6 +647,43 @@ impl Story {
         Ok(())
     }
 
+    /// Binds a resumable external function.
+    ///
+    /// The callback returns
+    /// [`ExternalOutcome::Pending`](crate::story::external_functions::ExternalOutcome::Pending)
+    /// when it cannot answer yet. The story then stops at that call; inspect [`Self::pending_external`]
+    /// and call [`Self::resume_external`] with the value the host computed.
+    /// Pending functions are never lookahead-safe.
+    pub fn bind_pending_external_function<F>(
+        &mut self,
+        name: &str,
+        function: F,
+    ) -> Result<(), StoryError>
+    where
+        F: PendingExternalFunction + 'static,
+    {
+        self.if_async_we_cant("bind an external function")?;
+        self.runtime
+            .bind_pending_external_function(name, function)?;
+        self.externals_validated = false;
+        Ok(())
+    }
+
+    /// The external call the story is currently waiting on, if any.
+    pub fn pending_external(&self) -> Option<&PendingExternal> {
+        self.runtime.pending_external()
+    }
+
+    /// Resumes the story after a pending external function.
+    ///
+    /// `value` is the function's result; `None` is Ink's void value. After this
+    /// returns, continue the story normally to finish the line or reach the next
+    /// pending call.
+    pub fn resume_external(&mut self, value: Option<ValueType>) -> Result<(), StoryError> {
+        self.choice_cache.borrow_mut().take();
+        self.runtime.resume_external(value)
+    }
+
     /// Removes a previously bound external function.
     pub fn unbind_external_function(&mut self, name: &str) -> Result<(), StoryError> {
         self.if_async_we_cant("unbind an external function")?;
@@ -656,6 +704,7 @@ impl Story {
     /// Writes a save state in the existing Ink JSON format.
     #[cfg(any(feature = "stream-json-parser", feature = "binary-image"))]
     pub fn save_state_to_writer(&self, writer: impl Write) -> Result<(), StoryError> {
+        self.ensure_no_pending_external()?;
         self.runtime.save_state_to_writer(writer)
     }
 
@@ -665,19 +714,31 @@ impl Story {
         feature = "serde-json-parser"
     ))]
     pub fn save_state_to_writer(&self, mut writer: impl Write) -> Result<(), StoryError> {
+        self.ensure_no_pending_external()?;
         writer.write_all(self.runtime.save_state_json()?.as_bytes())?;
         Ok(())
     }
 
     /// Saves state as Ink JSON.
     pub fn save_state(&self) -> Result<String, StoryError> {
+        self.ensure_no_pending_external()?;
         self.runtime.save_state_json()
+    }
+
+    fn ensure_no_pending_external(&self) -> Result<(), StoryError> {
+        if let Some(pending) = self.runtime.pending_external() {
+            return Err(StoryError::ExternalFunctionPending {
+                function_name: pending.name().to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// Loads a state written by this runtime or the existing Ink runtime.
     #[cfg(any(feature = "stream-json-parser", feature = "binary-image"))]
     pub fn load_state_from_reader(&mut self, reader: impl Read) -> Result<(), StoryError> {
         self.choice_cache.borrow_mut().take();
+        self.runtime.clear_pending_external();
         self.runtime.load_state_from_reader(reader)
     }
 
@@ -688,6 +749,7 @@ impl Story {
     ))]
     pub fn load_state_from_reader(&mut self, mut reader: impl Read) -> Result<(), StoryError> {
         self.choice_cache.borrow_mut().take();
+        self.runtime.clear_pending_external();
         let mut saved = String::new();
         reader.read_to_string(&mut saved)?;
         self.runtime.load_state_json(&saved)
@@ -696,6 +758,7 @@ impl Story {
     /// Loads a state written by this runtime or the existing Ink runtime.
     pub fn load_state(&mut self, saved: &str) -> Result<(), StoryError> {
         self.choice_cache.borrow_mut().take();
+        self.runtime.clear_pending_external();
         self.runtime.load_state_json(saved)
     }
 }
@@ -709,8 +772,7 @@ mod tests {
 
     #[test]
     fn public_story_runs_and_restores_a_choice() {
-        let json =
-            include_str!("../../../conformance-tests/inkfiles/choices/single-choice.ink.json");
+        let json = include_str!("../../../conformance-tests/inkfiles/choices/single-choice.ink.json");
         let mut story = Story::new_with_seed(json, 1).unwrap();
         assert_eq!(story.cont().unwrap(), "Hello, world!\n");
         while story.can_continue() {
@@ -732,8 +794,7 @@ mod tests {
 
     #[test]
     fn public_story_resets_without_reparsing_static_content() {
-        let json =
-            include_str!("../../../conformance-tests/inkfiles/choices/single-choice.ink.json");
+        let json = include_str!("../../../conformance-tests/inkfiles/choices/single-choice.ink.json");
         let mut flat = Story::new_with_seed(json, 1).unwrap();
         let first = flat.cont().unwrap();
         flat.reset_state().unwrap();

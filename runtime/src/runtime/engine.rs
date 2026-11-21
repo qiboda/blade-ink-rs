@@ -53,6 +53,7 @@ impl Runtime {
             previsited_container: None,
             continuation_active: false,
             newline_snapshot: None,
+            pending_external: None,
         };
         if let Some(global_decl) = runtime.data.named_child(runtime.data.root(), "global decl") {
             let global_decl = runtime.data.container_id(global_decl).ok_or_else(|| {
@@ -89,7 +90,19 @@ impl Runtime {
 
     /// Executes until a newline or the end of the current flow.
     pub(crate) fn cont(&mut self) -> Result<String, StoryError> {
-        Ok(self.cont_with_budget(|| Ok(false))?.unwrap())
+        match self.cont_with_budget(|| Ok(false))? {
+            ContinueStatus::Finished(text) => Ok(text),
+            ContinueStatus::Yielded => Err(StoryError::InvalidStoryState(
+                "continue yielded unexpectedly".to_owned(),
+            )),
+            ContinueStatus::PendingExternal => Err(StoryError::ExternalFunctionPending {
+                function_name: self
+                    .pending_external
+                    .as_ref()
+                    .map(|pending| pending.name().to_owned())
+                    .unwrap_or_default(),
+            }),
+        }
     }
 
     pub(crate) fn is_async_continue_active(&self) -> bool {
@@ -103,12 +116,13 @@ impl Runtime {
         self.choices.clear();
         self.continuation_active = false;
         self.newline_snapshot = None;
+        self.pending_external = None;
     }
 
     pub(crate) fn cont_with_budget(
         &mut self,
         mut should_yield: impl FnMut() -> Result<bool, StoryError>,
-    ) -> Result<Option<String>, StoryError> {
+    ) -> Result<ContinueStatus, StoryError> {
         if !self.continuation_active {
             if !self.can_continue() {
                 return Err(StoryError::InvalidStoryState(
@@ -124,7 +138,7 @@ impl Runtime {
         }
         self.continuation_active = true;
         let result = self.cont_internal(&mut should_yield);
-        if !matches!(result, Ok(None)) {
+        if matches!(result, Ok(ContinueStatus::Finished(_))) {
             self.continuation_active = false;
             self.changed_variables = self.variables.complete_variable_observation();
             self.newline_snapshot = None;
@@ -135,10 +149,14 @@ impl Runtime {
     pub(super) fn cont_internal(
         &mut self,
         should_yield: &mut impl FnMut() -> Result<bool, StoryError>,
-    ) -> Result<Option<String>, StoryError> {
+    ) -> Result<ContinueStatus, StoryError> {
         let mut newline_snapshot = self.newline_snapshot.take();
         while self.can_continue() {
             self.step()?;
+            if self.pending_external.is_some() {
+                self.newline_snapshot = newline_snapshot;
+                return Ok(ContinueStatus::PendingExternal);
+            }
             if self.lookahead_unsafe_external {
                 *self = *newline_snapshot.take().ok_or_else(|| {
                     StoryError::InvalidStoryState(
@@ -174,7 +192,7 @@ impl Runtime {
             }
             if should_yield()? {
                 self.newline_snapshot = newline_snapshot;
-                return Ok(None);
+                return Ok(ContinueStatus::Yielded);
             }
         }
         if !self.can_continue() && self.choices.is_empty() && !self.did_safe_exit {
@@ -182,7 +200,9 @@ impl Runtime {
                 "Ink had 1 error. It is strongly suggested that you assign an error handler to story.onError. The first issue was: RUNTIME ERROR: ran out of content. Do you need a '-> DONE' or '-> END'?".to_owned(),
             ));
         }
-        Ok(Some(clean_output_whitespace(&self.output)))
+        Ok(ContinueStatus::Finished(clean_output_whitespace(
+            &self.output,
+        )))
     }
 
     pub(crate) fn snapshot(&self) -> Self {
@@ -220,6 +240,7 @@ impl Runtime {
             previsited_container: self.previsited_container,
             continuation_active: self.continuation_active,
             newline_snapshot: None,
+            pending_external: self.pending_external.clone(),
         }
     }
 
@@ -316,6 +337,11 @@ impl Runtime {
                             )
                         })?;
                     self.call_external(&name, external_args)?;
+                    // The external suspended the story. Leave the pointer on the
+                    // EXTERNAL node; resume_external() advances past it later.
+                    if self.pending_external.is_some() {
+                        return Ok(());
+                    }
                     self.advance()?;
                     return Ok(());
                 }

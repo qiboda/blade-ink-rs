@@ -19,7 +19,10 @@ use crate::{
     push_pop::PushPopType,
     runtime::counters::StoryCounters,
     story::error::StoryError,
-    story::external_functions::{ExternalFunction, ExternalFunctionResult},
+    story::external_functions::{
+        ExternalFunction, ExternalFunctionResult, ExternalOutcome, PendingExternal,
+        PendingExternalFunction, PendingExternalFunctionResult,
+    },
     story_content::{
         ContainerId, ContentPointer, NodeId, NodeKindView, StaticStoryView, StoryContent,
         StoryData, ValueView,
@@ -77,11 +80,24 @@ pub(crate) struct Runtime {
     previsited_container: Option<ContainerId>,
     continuation_active: bool,
     newline_snapshot: Option<Box<Runtime>>,
+    pending_external: Option<PendingExternal>,
+}
+
+enum BoundExternalKind {
+    Sync(Box<dyn ExternalFunction>),
+    Pending(Box<dyn PendingExternalFunction>),
 }
 
 struct BoundExternal {
-    function: Box<dyn ExternalFunction>,
+    function: BoundExternalKind,
     lookahead_safe: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ContinueStatus {
+    Finished(String),
+    Yielded,
+    PendingExternal,
 }
 
 pub(crate) struct RuntimeFlow {

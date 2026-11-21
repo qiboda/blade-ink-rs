@@ -26,6 +26,12 @@ pub enum StoryError {
         function_name: String,
         error: ExternalFunctionError,
     },
+    /// The story stopped at an external function that must be resumed with
+    /// [`Story::resume_external`](crate::story::Story::resume_external).
+    ExternalFunctionPending {
+        /// Name of the external function that is waiting.
+        function_name: String,
+    },
     /// A client-provided variable observer failed.
     VariableObserverFailed {
         variable_name: String,
@@ -41,6 +47,9 @@ impl StoryError {
             | StoryError::BadImage(msg)
             | StoryError::BadArgument(msg) => msg.clone(),
             StoryError::ExternalFunctionFailed { error, .. } => error.to_string(),
+            StoryError::ExternalFunctionPending { function_name } => {
+                format!("External function '{function_name}' is pending")
+            }
             StoryError::VariableObserverFailed { error, .. } => error.to_string(),
         }
     }
@@ -65,6 +74,9 @@ impl fmt::Display for StoryError {
                 function_name,
                 error,
             } => write!(f, "External function '{function_name}' failed: {error}"),
+            StoryError::ExternalFunctionPending { function_name } => {
+                write!(f, "External function '{function_name}' is pending")
+            }
             StoryError::VariableObserverFailed {
                 variable_name,
                 error,

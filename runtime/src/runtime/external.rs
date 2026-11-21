@@ -21,8 +21,36 @@ impl Runtime {
         externals.insert(
             name.to_owned(),
             BoundExternal {
-                function: Box::new(function),
+                function: BoundExternalKind::Sync(Box::new(function)),
                 lookahead_safe,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn bind_pending_external_function<F>(
+        &mut self,
+        name: &str,
+        function: F,
+    ) -> Result<(), StoryError>
+    where
+        F: PendingExternalFunction + 'static,
+    {
+        let mut externals = self.externals.borrow_mut();
+        if externals.contains_key(name) {
+            return Err(StoryError::BadArgument(format!(
+                "Function '{name}' has already been bound."
+            )));
+        }
+        // A pending call cannot be executed speculatively during lookahead: the
+        // lookahead would have to be rolled back and retried, which is not a
+        // supported state transition. Marking it unsafe makes the engine rewind
+        // to the last newline and execute it for real instead.
+        externals.insert(
+            name.to_owned(),
+            BoundExternal {
+                function: BoundExternalKind::Pending(Box::new(function)),
+                lookahead_safe: false,
             },
         );
         Ok(())
@@ -133,22 +161,65 @@ impl Runtime {
             args.push(value.value.clone());
         }
         args.reverse();
-        let result: ExternalFunctionResult = self
-            .externals
-            .borrow_mut()
-            .get_mut(name)
-            .unwrap()
-            .function
-            .call(name, &args);
-        let result = result.map_err(|error| StoryError::ExternalFunctionFailed {
+        enum Call {
+            Sync(ExternalFunctionResult),
+            Pending(PendingExternalFunctionResult),
+        }
+        let call = {
+            let mut externals = self.externals.borrow_mut();
+            let bound = externals.get_mut(name).ok_or_else(|| {
+                StoryError::InvalidStoryState(format!(
+                    "Trying to call EXTERNAL function '{name}' which has not been bound."
+                ))
+            })?;
+            match &mut bound.function {
+                BoundExternalKind::Sync(function) => Call::Sync(function.call(name, &args)),
+                BoundExternalKind::Pending(function) => Call::Pending(function.call(name, &args)),
+            }
+        };
+        let failure = |error| StoryError::ExternalFunctionFailed {
             function_name: name.to_owned(),
             error,
-        })?;
-        match result {
+        };
+        match call {
+            Call::Sync(result) => match result.map_err(failure)? {
+                Some(value) => self.push_evaluation(Rc::new(Value::new_value_type(value))),
+                None => self.evaluation_stack.push(Rc::new(Void::new())),
+            },
+            Call::Pending(result) => match result.map_err(failure)? {
+                ExternalOutcome::Done(Some(value)) => {
+                    self.push_evaluation(Rc::new(Value::new_value_type(value)));
+                }
+                ExternalOutcome::Done(None) => {
+                    self.evaluation_stack.push(Rc::new(Void::new()));
+                }
+                ExternalOutcome::Pending => {
+                    self.pending_external = Some(PendingExternal::new(name.to_owned(), args));
+                }
+            },
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pending_external(&self) -> Option<&PendingExternal> {
+        self.pending_external.as_ref()
+    }
+
+    pub(crate) fn clear_pending_external(&mut self) {
+        self.pending_external = None;
+    }
+
+    pub(crate) fn resume_external(&mut self, value: Option<ValueType>) -> Result<(), StoryError> {
+        if self.pending_external.take().is_none() {
+            return Err(StoryError::InvalidStoryState(
+                "No pending external function to resume".to_owned(),
+            ));
+        }
+        match value {
             Some(value) => self.push_evaluation(Rc::new(Value::new_value_type(value))),
             None => self.evaluation_stack.push(Rc::new(Void::new())),
         }
-        Ok(())
+        self.advance()
     }
 
     pub(super) fn push_int(&mut self, value: i32) {
