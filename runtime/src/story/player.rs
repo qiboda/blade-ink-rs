@@ -772,7 +772,8 @@ mod tests {
 
     #[test]
     fn public_story_runs_and_restores_a_choice() {
-        let json = include_str!("../../../conformance-tests/inkfiles/choices/single-choice.ink.json");
+        let json =
+            include_str!("../../../conformance-tests/inkfiles/choices/single-choice.ink.json");
         let mut story = Story::new_with_seed(json, 1).unwrap();
         assert_eq!(story.cont().unwrap(), "Hello, world!\n");
         while story.can_continue() {
@@ -794,7 +795,8 @@ mod tests {
 
     #[test]
     fn public_story_resets_without_reparsing_static_content() {
-        let json = include_str!("../../../conformance-tests/inkfiles/choices/single-choice.ink.json");
+        let json =
+            include_str!("../../../conformance-tests/inkfiles/choices/single-choice.ink.json");
         let mut flat = Story::new_with_seed(json, 1).unwrap();
         let first = flat.cont().unwrap();
         flat.reset_state().unwrap();

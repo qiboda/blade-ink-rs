@@ -1,16 +1,16 @@
 [package]
 name = "bladeink"
-version.workspace = true
-authors.workspace = true
+version = "2.1.0"
+authors = ["Rafael Garcia <bladecoder@gmail.com>"]
 description = """
 This is a Rust port of inkle's ink, a scripting language for writing interactive narrative.
 """
-license.workspace = true
-repository.workspace = true
+license = "Apache-2.0"
+repository = "https://github.com/bladecoder/blade-ink-rs/"
 keywords = ["ink", "gamedev", "narrative"]
 categories = ["game-development"]
 readme = "../README.md"
-edition.workspace = true
+edition = "2024"
 
 [lib]
 name = "bladeink"
@@ -21,10 +21,10 @@ name = "image_story_cost"
 required-features = ["std", "binary-image"]
 
 [dependencies]
-serde_json = { workspace = true, optional = true }
+serde_json = { version = "1.0.151", optional = true }
 strum = { version = "0.28", default-features = false, features = ["derive"] }
 as-any = "0.3.0"
-rand = { workspace = true, features = ["std_rng"] }
+rand = { version = "0.10.2", default-features = false, features = ["std_rng"] }
 web-time = { version = "1.1.0", optional = true }
 hashbrown = "0.16"
 libm = "0.2"
